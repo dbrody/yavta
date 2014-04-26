@@ -29,6 +29,12 @@
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <netdb.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#include <arpa/inet.h>
 
 #include <linux/videodev2.h>
 #include "videodev2-fsr172x.h"
@@ -38,6 +44,8 @@
 #endif
 
 #define ARRAY_SIZE(a)	(sizeof(a)/sizeof((a)[0]))
+
+#define HOST_MAXDATASIZE (1024)
 
 struct buffer
 {
@@ -810,9 +818,97 @@ static int video_prepare_capture(struct device *dev, int nbufs, unsigned int off
 	return 0;
 }
 
+
+/* Network helpers */
+
+// get sockaddr, IPv4 or IPv6:
+void *get_in_addr(struct sockaddr *sa)
+{
+    if (sa->sa_family == AF_INET) {
+        return &(((struct sockaddr_in*)sa)->sin_addr);
+    }
+
+    return &(((struct sockaddr_in6*)sa)->sin6_addr);
+}
+
+in_port_t get_in_port(struct sockaddr *sa)
+{
+    if (sa->sa_family == AF_INET) {
+        return (((struct sockaddr_in*)sa)->sin_port);
+    }
+
+    return (((struct sockaddr_in6*)sa)->sin6_port);
+}
+
+
+struct addrinfo* setup_remote_host(const char* host_ip, const char* host_port, int* sockfd){
+	struct addrinfo hints, *servinfo, *p;
+	int rv;
+	char s[INET6_ADDRSTRLEN];
+
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	
+	if((rv = getaddrinfo(host_ip, host_port, &hints, &servinfo)) != 0) {
+		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+		return NULL;
+	}
+
+	for(p = servinfo; p != NULL; p = p->ai_next) {
+		if((*sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
+			perror("client: socket");
+			continue;
+		}
+
+		if(connect(*sockfd, p->ai_addr, p->ai_addrlen) == -1) {
+			close(*sockfd);
+			perror("client: connect");
+			continue;
+		}
+		
+		break;
+	}
+
+	if(p == NULL){
+		fprintf(stderr, "client: failed to connect\n");
+		return NULL;
+	}
+
+	
+	inet_ntop(p->ai_family, get_in_addr((struct sockaddr *)p->ai_addr), s, sizeof s);
+	int port = get_in_port((struct sockaddr*)p->ai_addr);
+	printf("client: connecting to %s:%d\n", s, port);
+
+	return p;
+}
+
+int sendDataToHost(int hostfd, struct addrinfo* p, char* buf, int size){
+	int numbytes = 0;
+	printf("Sending %d bytes to %s\n", size, (char*)get_in_addr((struct sockaddr *)p->ai_addr));
+
+	char sizeMsg[10];
+	sprintf(sizeMsg, "%10u", size);
+	if((numbytes = send(hostfd, sizeMsg, 10, 0)) == -1){
+		printf("Sent data: %d\n", numbytes);
+		perror("talker: sendto");
+		fprintf(stderr, "Unable to send data.\n");
+		exit(1);
+	}
+
+	if((numbytes = send(hostfd, buf, size, 0)) == -1){
+		printf("Sent data: %d\n", numbytes);
+		perror("talker: sendto");
+		fprintf(stderr, "Unable to send data.\n");
+		exit(1);
+	}
+	return numbytes;
+}
+
+
 static int video_do_capture(struct device *dev, unsigned int nframes,
 	unsigned int skip, unsigned int delay, const char *filename_prefix,
-	int do_requeue_last)
+	int do_requeue_last, int hostfp, struct addrinfo* p)
 {
 	char *filename = NULL;
 	struct timeval start = { 0, 0 };
@@ -869,7 +965,12 @@ static int video_do_capture(struct device *dev, unsigned int nframes,
 		if (i == 0)
 			start = ts;
 
-		/* Save the image. */
+		/* Stream image to host */
+		if (dev->type == V4L2_BUF_TYPE_VIDEO_CAPTURE && p != NULL && hostfp > 0){
+			sendDataToHost(hostfp, p, dev->buffers[buf.index].mem, buf.bytesused);
+		}
+
+		/* Save the image. */		
 		if (dev->type == V4L2_BUF_TYPE_VIDEO_CAPTURE && filename_prefix && !skip) {
 			sprintf(filename, "%s-%06u.bin", filename_prefix, i);
 			file = fopen(filename, "wb");
@@ -927,6 +1028,7 @@ done:
 	return video_free_buffers(dev);
 }
 
+
 #define V4L_BUFFERS_DEFAULT	8
 #define V4L_BUFFERS_MAX	32
 
@@ -949,6 +1051,8 @@ static void usage(const char *argv0)
 	printf("-t, --time-per-frame num/denom	Set the time per frame (eg. 1/25 = 25 fps)\n");
 	printf("-u, --userptr			Use the user pointers streaming method\n");
 	printf("-w, --set-control 'ctrl value'	Set control 'ctrl' to 'value'\n");
+	printf("    --host-ip[=ip]		Set IP of host\n");
+	printf("    --host-port[=port]		Set Port of host\n");
 	printf("    --enum-formats		Enumerate formats\n");
 	printf("    --enum-inputs		Enumerate inputs\n");
 	printf("    --no-query			Don't query capabilities on open\n");
@@ -965,12 +1069,16 @@ static void usage(const char *argv0)
 #define OPT_SLEEP_FOREVER	260
 #define OPT_USERPTR_OFFSET	261
 #define OPT_REQUEUE_LAST	262
+#define OPT_HOST_IP		263
+#define OPT_HOST_PORT		264
 
 static struct option opts[] = {
 	{"capture", 2, 0, 'c'},
 	{"delay", 1, 0, 'd'},
 	{"enum-formats", 0, 0, OPT_ENUM_FORMATS},
 	{"enum-inputs", 0, 0, OPT_ENUM_INPUTS},
+	{"host-ip", 1, 0, OPT_HOST_IP},
+	{"host-port", 1, 0, OPT_HOST_PORT},  
 	{"file", 2, 0, 'F'},
 	{"format", 1, 0, 'f'},
 	{"help", 0, 0, 'h'},
@@ -1004,6 +1112,7 @@ int main(int argc, char *argv[])
 	int do_enum_inputs = 0, do_set_input = 0;
 	int do_list_controls = 0, do_get_control = 0, do_set_control = 0;
 	int do_sleep_forever = 0, do_requeue_last = 0;
+	int do_host = 0, do_host_port = 0;
 	int no_query = 0;
 	char *endptr;
 	int c;
@@ -1028,6 +1137,13 @@ int main(int argc, char *argv[])
 	unsigned int delay = 0, nframes = (unsigned int)-1;
 	const char *filename = "/dev/shm/capture.output";
 
+	/* Remote host support */
+	const char *host_ip = "";
+	const char *host_port = NULL;
+	struct addrinfo *p = NULL;
+	int hostfd;
+	char buf[HOST_MAXDATASIZE];
+	
 	opterr = 0;
 	while ((c = getopt_long(argc, argv, "c::d:f:F::hi:ln:pq:r:s:t:uw:", opts, NULL)) != -1) {
 
@@ -1162,6 +1278,14 @@ int main(int argc, char *argv[])
 		case OPT_USERPTR_OFFSET:
 			userptr_offset = atoi(optarg);
 			break;
+		case OPT_HOST_IP:
+			do_host = 1;
+			host_ip = optarg;
+			break;
+		case OPT_HOST_PORT:
+			do_host_port = 1;
+			host_port = optarg;
+			break;
 		default:
 			printf("Invalid option -%c\n", c);
 			printf("Run %s -h for help.\n", argv[0]);
@@ -1177,10 +1301,31 @@ int main(int argc, char *argv[])
 	if (!do_file)
 		filename = NULL;
 
+	if (do_host + do_host_port > 0 && do_host + do_host_port != 2){
+		printf("If used, both --host-ip and --host-port must be set.\n");
+		return 1;
+	}
+
+	if (do_host) {
+		printf("Connecting to host: %s:%s\n", host_ip, host_port);
+		p = setup_remote_host(host_ip, host_port, &hostfd);
+		if ( p == NULL){
+			fprintf(stderr, "Unable to connect to host.\n");
+			exit(3);
+		}
+
+		// Write some test data
+		char* data = "Hello World!\r\n";
+		strcpy(buf, data);
+		//sendDataToHost(hostfd, p, buf, sizeof(buf));
+	}
+
 	/* Open the video device. */
 	ret = video_open(&dev, argv[optind], no_query);
-	if (ret < 0)
+	if (ret < 0) {
+		fprintf(stderr, "Unable to open video.\n");
 		return 1;
+	}
 
 	dev.memtype = memtype;
 
@@ -1253,9 +1398,13 @@ int main(int argc, char *argv[])
 		getchar();
 	}
 
-	if (video_do_capture(&dev, nframes, skip, delay, filename, do_requeue_last) < 0) {
+	if (video_do_capture(&dev, nframes, skip, delay, filename, do_requeue_last, hostfd, p) < 0) {
 		video_close(&dev);
 		return 1;
+	}
+
+	if ( hostfd > 0){
+		close(hostfd);
 	}
 
 	video_close(&dev);
