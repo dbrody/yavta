@@ -19,15 +19,13 @@ FSR172X
 GumStix Example with Caspa
 --------------------------
     
-    `
     media-ctl -r
     media-ctl -v -l '"mt9v032 3-005c":0->"OMAP3 ISP CCDC":0[1]'
     media-ctl -v -l '"OMAP3 ISP CCDC":1->"OMAP3 ISP CCDC output":0[1]'
     media-ctl -v -V '"mt9v032 3-005c":0 [SGRBG10 752x480]'
     media-ctl -v -V '"OMAP3 ISP CCDC":1 [SGRBG10 752x480]'
 
-    ./yavta -f SGRBG10 -s 752x480 -n 4 --capture=200 --skip=1000 $(media-ctl -e "OMAP3 ISP CCDC output") --host-ip 10.1.4.115 --host-port=3490
-    `
+    yavta -f SGRBG10 -s 752x480 -n 4 --capture=200 --skip=1000 $(media-ctl -e "OMAP3 ISP CCDC output") --host-ip 10.1.4.115 --host-port=3490
 
 
 
